@@ -1,0 +1,32 @@
+@import "tailwindcss";
+
+/* ---- Force scrolling to work inside the Reddit in-app webview ---- */
+html,
+body {
+  height: auto !important;
+  min-height: 100% !important;
+  overflow-y: auto !important;
+  overflow-x: hidden !important;
+
+  /* iOS momentum scroll */
+  -webkit-overflow-scrolling: touch;
+
+  /* allow finger scrolling */
+  touch-action: pan-y;
+}
+
+#root {
+  height: auto !important;
+  min-height: 100vh !important;
+  overflow: visible !important;
+}
+
+/* Some webviews lock scrolling by fixing body */
+body {
+  position: static !important;
+}
+
+/* Avoid weird “bounce locks” */
+* {
+  overscroll-behavior: contain;
+}
