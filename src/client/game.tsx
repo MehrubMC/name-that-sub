@@ -5,6 +5,7 @@ import {
   apiGetState,
   apiGuess,
   apiLockMode,
+  apiGiveUp,
   type GetStateResponse,
   type GameMode,
 } from "../shared/api";
@@ -23,7 +24,7 @@ function utcTomorrowKey() {
   d.setUTCDate(d.getUTCDate() + 1);
   const y = d.getUTCFullYear();
   const m = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const day = String(d.getUTCDate()).padStart(2, "0");
+  const day = String(d.getUTCUTCDate?.() ?? d.getUTCDate()).padStart(2, "0"); // safety
   return `${y}-${m}-${day}`;
 }
 
@@ -43,18 +44,38 @@ function Modal({
   return (
     <div style={styles.modalOverlay} onClick={onClose}>
       <div style={styles.modalCard} onClick={(e) => e.stopPropagation()}>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 12,
+          }}
+        >
           <div style={{ fontSize: 18, fontWeight: 800 }}>{title}</div>
           <button onClick={onClose} style={styles.iconBtn} aria-label="Close">
             ✕
           </button>
         </div>
 
-        <div style={{ marginTop: 10, color: "rgba(255,255,255,0.85)", lineHeight: 1.4 }}>
+        <div
+          style={{
+            marginTop: 10,
+            color: "rgba(255,255,255,0.85)",
+            lineHeight: 1.4,
+          }}
+        >
           {body}
         </div>
 
-        <div style={{ marginTop: 14, display: "flex", gap: 10, justifyContent: "flex-end" }}>
+        <div
+          style={{
+            marginTop: 14,
+            display: "flex",
+            gap: 10,
+            justifyContent: "flex-end",
+          }}
+        >
           <button onClick={onClose} style={styles.primaryBtn}>
             Got it
           </button>
@@ -82,18 +103,43 @@ function GameApp() {
   // MODE
   const [mode, setMode] = useState<GameMode>(() => {
     const saved = localStorage.getItem("nts:mode");
-    return saved === "easy" || saved === "medium" || saved === "hard" ? saved : "medium";
+    return saved === "easy" || saved === "medium" || saved === "hard"
+      ? saved
+      : "medium";
   });
 
   useEffect(() => {
     localStorage.setItem("nts:mode", mode);
   }, [mode]);
 
+  function openAlreadyPlayedModal(m: GameMode) {
+    const tomorrow = utcTomorrowKey();
+    setModalTitle("Already played");
+    setModalBody(
+      <div>
+        <div style={{ marginBottom: 10 }}>
+          You already played <span style={{ fontWeight: 900 }}>{m.toUpperCase()}</span>{" "}
+          today. Come back tomorrow for a new puzzle.
+        </div>
+        <div style={styles.callout}>
+          Next puzzle available{" "}
+          <span style={{ opacity: 0.9 }}>(UTC: {tomorrow})</span>.
+        </div>
+      </div>
+    );
+    setModalOpen(true);
+  }
+
   useEffect(() => {
     (async () => {
       try {
         const s = await apiGetState(mode);
         setState(s);
+
+        // if they load into a completed mode, tell them
+        if (s.completedToday) {
+          setToast(`You already played ${mode.toUpperCase()} today.`);
+        }
       } catch (e: any) {
         setToast(e?.message ?? "Failed to load game.");
       } finally {
@@ -122,6 +168,7 @@ function GameApp() {
               ...prev,
               modeIsLocked: true,
               modeLocked: res.modeLocked ?? prev.modeLocked,
+              completedToday: res.completedToday ?? prev.completedToday,
             }
           : prev
       );
@@ -132,6 +179,10 @@ function GameApp() {
 
   async function nextClue() {
     setToast(null);
+    if (state?.completedToday) {
+      openAlreadyPlayedModal(mode);
+      return;
+    }
     if (stage === 1) await lockIfNeeded();
     setStage((s) => (s === 1 ? 2 : s === 2 ? 3 : 3));
   }
@@ -142,8 +193,8 @@ function GameApp() {
     setModalBody(
       <div>
         <div style={{ marginBottom: 10 }}>
-          {kind === "win" ? "You got it." : "Better luck next time."} The answer was{" "}
-          <span style={{ fontWeight: 800 }}>r/{answer}</span>.
+          {kind === "win" ? "You got it." : "Better luck next time."} The answer
+          was <span style={{ fontWeight: 800 }}>r/{answer}</span>.
         </div>
         <div style={styles.callout}>
           Come back tomorrow for the next puzzle{" "}
@@ -156,6 +207,11 @@ function GameApp() {
 
   async function submitGuess() {
     if (!puzzle) return;
+    if (state?.completedToday) {
+      openAlreadyPlayedModal(mode);
+      return;
+    }
+
     const cleaned = normalizeInput(guess);
     if (!cleaned) return;
 
@@ -165,16 +221,25 @@ function GameApp() {
     try {
       const res = await apiGuess(cleaned, stage, mode);
 
-      // reflect commit/lock for this mode
-      if (res.modeIsLocked) {
-        setState((prev) =>
-          prev ? { ...prev, modeIsLocked: true, modeLocked: res.modeLocked ?? prev.modeLocked } : prev
-        );
-      }
+      // keep state consistent immediately
+      setState((prev) =>
+        prev
+          ? {
+              ...prev,
+              modeIsLocked: true,
+              modeLocked: res.modeLocked ?? prev.modeLocked,
+              completedToday: res.completedToday ?? prev.completedToday,
+              totalScore: res.totalScore ?? prev.totalScore,
+              streak: res.streak ?? prev.streak,
+            }
+          : prev
+      );
 
       if (res.correct) {
         setRevealedAnswer(res.answer);
-        setToast(`✅ Correct! +${res.pointsAwarded} pts · Streak ${res.streak} · Total ${res.totalScore}`);
+        setToast(
+          `✅ Correct! +${res.pointsAwarded} pts · Streak ${res.streak} · Total ${res.totalScore}`
+        );
         openComeBackModal("win", res.answer);
       } else {
         if (stage < 3) setToast("❌ Not quite. Reveal the next clue or try again.");
@@ -185,6 +250,7 @@ function GameApp() {
         }
       }
 
+      // refresh state for the current mode
       const s = await apiGetState(mode);
       setState(s);
     } catch (e: any) {
@@ -194,12 +260,44 @@ function GameApp() {
     }
   }
 
-  function giveUp() {
+  async function giveUp() {
     if (!puzzle) return;
-    setStage(3);
-    setRevealedAnswer(puzzle.subreddit);
-    setToast(`Answer: r/${puzzle.subreddit}`);
-    openComeBackModal("giveup", puzzle.subreddit);
+
+    if (state?.completedToday) {
+      openAlreadyPlayedModal(mode);
+      return;
+    }
+
+    setSubmitting(true);
+    setToast(null);
+
+    try {
+      const res = await apiGiveUp(mode);
+
+      setStage(3);
+      setRevealedAnswer(res.answer);
+
+      setState((prev) =>
+        prev
+          ? {
+              ...prev,
+              modeLocked: res.modeLocked ?? prev.modeLocked,
+              modeIsLocked: true,
+              completedToday: true,
+            }
+          : prev
+      );
+
+      setToast(`Answer: r/${res.answer}`);
+      openComeBackModal("giveup", res.answer);
+
+      const s = await apiGetState(mode);
+      setState(s);
+    } catch (e: any) {
+      setToast(e?.message ?? "Failed to give up.");
+    } finally {
+      setSubmitting(false);
+    }
   }
 
   useEffect(() => {
@@ -223,6 +321,12 @@ function GameApp() {
       setStage(1);
       setGuess("");
       setRevealedAnswer(null);
+
+      // IMPORTANT: show popup if they already played this mode
+      if (s.completedToday) {
+        setToast(`You already played ${m.toUpperCase()} today.`);
+        openAlreadyPlayedModal(m);
+      }
     } catch (e: any) {
       setToast(e?.message ?? "Failed to switch mode.");
     } finally {
@@ -235,8 +339,12 @@ function GameApp() {
       <div style={styles.pageFixed}>
         <div style={styles.centerWrap}>
           <div style={styles.glassCard}>
-            <div style={{ fontSize: 18, fontWeight: 800 }}>Loading today’s puzzle…</div>
-            <div style={{ marginTop: 10, opacity: 0.75 }}>Fetching a cursed comment from Reddit.</div>
+            <div style={{ fontSize: 18, fontWeight: 800 }}>
+              Loading today’s puzzle…
+            </div>
+            <div style={{ marginTop: 10, opacity: 0.75 }}>
+              Fetching a cursed comment from Reddit.
+            </div>
           </div>
         </div>
       </div>
@@ -248,22 +356,26 @@ function GameApp() {
       <div style={styles.pageFixed}>
         <div style={styles.centerWrap}>
           <div style={styles.glassCard}>
-            <div style={{ fontSize: 18, fontWeight: 900 }}>Couldn’t load today’s puzzle</div>
-            <div style={{ marginTop: 10, opacity: 0.8 }}>{toast ?? "Try refreshing."}</div>
+            <div style={{ fontSize: 18, fontWeight: 900 }}>
+              Couldn’t load today’s puzzle
+            </div>
+            <div style={{ marginTop: 10, opacity: 0.8 }}>
+              {toast ?? "Try refreshing."}
+            </div>
           </div>
         </div>
       </div>
     );
   }
 
-  const disabled = submitting || !!revealedAnswer;
+  const completed = !!state.completedToday;
+  const disabled = submitting || !!revealedAnswer || completed;
 
   return (
     <div style={styles.pageFixed}>
       <div style={styles.topGlow} />
 
       <div style={styles.shell}>
-        {/* Header (non-scrolling) */}
         <header style={styles.header}>
           <div>
             <div style={styles.titleRow}>
@@ -274,10 +386,16 @@ function GameApp() {
               Daily <span style={styles.mono}>{puzzle.dateKey}</span> · Score{" "}
               <span style={styles.mono}>{state.totalScore}</span> · Streak{" "}
               <span style={styles.mono}>{state.streak}</span>
-              {" · "}
-              Mode <span style={styles.mono}>{mode.toUpperCase()}</span>
-              {state.modeIsLocked ? <span style={{ opacity: 0.8 }}> · Locked</span> : null}
+              {" · "}Mode <span style={styles.mono}>{mode.toUpperCase()}</span>
             </div>
+
+            {completed && (
+              <div style={{ marginTop: 8 }}>
+                <div style={styles.completedBanner}>
+                  You already played this mode today — come back tomorrow.
+                </div>
+              </div>
+            )}
           </div>
 
           <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
@@ -301,14 +419,14 @@ function GameApp() {
           </div>
         </header>
 
-        {/* Scrollable content area */}
         <div style={styles.scrollArea}>
           <div style={styles.wrap}>
-            {/* Clue Card */}
             <section style={styles.glassCard}>
               <div style={styles.cardTopRow}>
                 <div style={styles.pill}>{stageLabel}</div>
-                <div style={{ opacity: 0.65, fontSize: 12 }}>Tip: Guess earlier for more points.</div>
+                <div style={{ opacity: 0.65, fontSize: 12 }}>
+                  Tip: Guess earlier for more points.
+                </div>
               </div>
 
               <div style={styles.block}>
@@ -320,7 +438,11 @@ function GameApp() {
                 <div style={styles.block}>
                   <div style={styles.blockLabel}>Post body</div>
                   <div style={styles.textBlock}>
-                    {puzzle.postBody?.trim() ? puzzle.postBody : <i style={{ opacity: 0.8 }}>(No body — title-only post)</i>}
+                    {puzzle.postBody?.trim() ? (
+                      puzzle.postBody
+                    ) : (
+                      <i style={{ opacity: 0.8 }}>(No body — title-only post)</i>
+                    )}
                   </div>
                 </div>
               )}
@@ -333,7 +455,6 @@ function GameApp() {
               )}
             </section>
 
-            {/* Sticky Controls (always reachable) */}
             <section style={styles.controlsSticky}>
               <div style={styles.controlsInner}>
                 <div style={styles.inputRow}>
@@ -346,16 +467,28 @@ function GameApp() {
                     disabled={disabled}
                     onKeyDown={(e) => e.key === "Enter" && submitGuess()}
                   />
-                  <button onClick={submitGuess} disabled={disabled || !guess.trim()} style={styles.primaryBtn}>
+                  <button
+                    onClick={submitGuess}
+                    disabled={disabled || !guess.trim()}
+                    style={styles.primaryBtn}
+                  >
                     Guess
                   </button>
                 </div>
 
                 <div style={styles.btnRow}>
-                  <button onClick={nextClue} disabled={disabled || stage === 3} style={styles.secondaryBtn}>
+                  <button
+                    onClick={nextClue}
+                    disabled={disabled || stage === 3}
+                    style={styles.secondaryBtn}
+                  >
                     Reveal next clue
                   </button>
-                  <button onClick={giveUp} disabled={disabled} style={styles.ghostBtn}>
+                  <button
+                    onClick={giveUp}
+                    disabled={disabled}
+                    style={styles.ghostBtn}
+                  >
                     Give up
                   </button>
                 </div>
@@ -364,11 +497,11 @@ function GameApp() {
 
             <footer style={styles.footer}>
               <div style={{ opacity: 0.75 }}>
-                Make it a daily habit. Drop a comment with what clue you got it on 👀
+                Make it a daily habit. Drop a comment with what clue you got it on
+                👀
               </div>
             </footer>
 
-            {/* bottom padding so content isn't hidden behind sticky controls */}
             <div style={{ height: 18 }} />
           </div>
         </div>
@@ -380,14 +513,18 @@ function GameApp() {
         </div>
       )}
 
-      <Modal open={modalOpen} title={modalTitle} body={modalBody} onClose={() => setModalOpen(false)} />
+      <Modal
+        open={modalOpen}
+        title={modalTitle}
+        body={modalBody}
+        onClose={() => setModalOpen(false)}
+      />
     </div>
   );
 }
 
 // ----- Styles -----
 const styles: Record<string, React.CSSProperties> = {
-  // IMPORTANT: fixed viewport + internal scroll
   pageFixed: {
     position: "fixed",
     inset: 0,
@@ -404,7 +541,8 @@ const styles: Record<string, React.CSSProperties> = {
     position: "absolute",
     inset: 0,
     pointerEvents: "none",
-    background: "radial-gradient(600px 240px at 50% 0%, rgba(255,255,255,0.10), transparent 70%)",
+    background:
+      "radial-gradient(600px 240px at 50% 0%, rgba(255,255,255,0.10), transparent 70%)",
   },
   shell: {
     position: "relative",
@@ -439,7 +577,8 @@ const styles: Record<string, React.CSSProperties> = {
     alignItems: "flex-start",
     justifyContent: "space-between",
     gap: 16,
-    padding: "0 max(16px, env(safe-area-inset-right)) 10px max(16px, env(safe-area-inset-left))",
+    padding:
+      "0 max(16px, env(safe-area-inset-right)) 10px max(16px, env(safe-area-inset-left))",
     flexWrap: "wrap",
   },
   titleRow: { display: "flex", alignItems: "center", gap: 10 },
@@ -457,6 +596,19 @@ const styles: Record<string, React.CSSProperties> = {
     fontFamily:
       'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
     fontWeight: 700,
+  },
+
+  completedBanner: {
+    display: "inline-block",
+    padding: "8px 10px",
+    borderRadius: 12,
+    background: "rgba(255,255,255,0.08)",
+    border: "1px solid rgba(255,255,255,0.14)",
+    backdropFilter: "blur(14px)",
+    WebkitBackdropFilter: "blur(14px)",
+    fontWeight: 800,
+    fontSize: 12,
+    opacity: 0.95,
   },
 
   badge: {
@@ -524,7 +676,6 @@ const styles: Record<string, React.CSSProperties> = {
     wordBreak: "break-word",
   },
 
-  // Sticky controls
   controlsSticky: {
     position: "sticky",
     bottom: 0,
@@ -541,7 +692,12 @@ const styles: Record<string, React.CSSProperties> = {
     boxShadow: "0 -10px 40px rgba(0,0,0,0.35)",
   },
 
-  inputRow: { display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" },
+  inputRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: 10,
+    flexWrap: "wrap",
+  },
   inputPrefix: {
     padding: "10px 12px",
     borderRadius: 12,
@@ -567,7 +723,8 @@ const styles: Record<string, React.CSSProperties> = {
     padding: "10px 14px",
     borderRadius: 12,
     border: "1px solid rgba(255,255,255,0.18)",
-    background: "linear-gradient(180deg, rgba(255,69,0,0.95), rgba(255,69,0,0.75))",
+    background:
+      "linear-gradient(180deg, rgba(255,69,0,0.95), rgba(255,69,0,0.75))",
     color: "white",
     fontWeight: 900,
     cursor: "pointer",
@@ -684,7 +841,8 @@ const styles: Record<string, React.CSSProperties> = {
     padding: "8px 10px",
     borderRadius: 999,
     border: "1px solid rgba(255,255,255,0.18)",
-    background: "linear-gradient(180deg, rgba(255,69,0,0.95), rgba(255,69,0,0.65))",
+    background:
+      "linear-gradient(180deg, rgba(255,69,0,0.95), rgba(255,69,0,0.65))",
     color: "white",
     fontWeight: 900,
     fontSize: 12,

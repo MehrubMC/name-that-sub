@@ -91,141 +91,79 @@ function kLastDate(userId: string, mode: GameMode) {
   return `nts:user:${userId}:${mode}:lastDate`;
 }
 function kPlayed(userId: string, mode: GameMode, dateKey: string) {
-  return `nts:user:${userId}:${mode}:played:${dateKey}`;
+  return `nts:user:${userId}:${mode}:played:${dateKey}`; // points awarded once/day/mode (on win)
 }
-// Commit lock is per-mode now. It just means "you committed on this mode today".
 function kCommit(userId: string, mode: GameMode, dateKey: string) {
-  return `nts:user:${userId}:${mode}:commit:${dateKey}`;
+  return `nts:user:${userId}:${mode}:commit:${dateKey}`; // lock after first reveal or guess
+}
+function kCompleted(userId: string, mode: GameMode, dateKey: string) {
+  return `nts:user:${userId}:${mode}:completed:${dateKey}`; // finished (win OR final loss OR give up)
 }
 
-// -------- per-mode commit storage --------
-async function readCommitted(
-  userId: string,
-  mode: GameMode,
-  dateKey: string
-): Promise<boolean> {
+async function readCommitted(userId: string, mode: GameMode, dateKey: string): Promise<boolean> {
   return (await redis.get(kCommit(userId, mode, dateKey))) === "1";
 }
 
-async function commitMode(
-  userId: string,
-  mode: GameMode,
-  dateKey: string
-): Promise<void> {
+async function commitMode(userId: string, mode: GameMode, dateKey: string): Promise<void> {
   const key = kCommit(userId, mode, dateKey);
   await redis.set(key, "1");
   await redis.expire(key, 60 * 60 * 48);
 }
 
-// ------------------------------
-// Deterministic shuffle + safe info fetch
-// ------------------------------
-function shuffleDeterministic<T>(arr: T[], seed: number): T[] {
-  const a = arr.slice();
-  let x = seed || 123456789;
-  for (let i = a.length - 1; i > 0; i--) {
-    x ^= x << 13;
-    x ^= x >> 17;
-    x ^= x << 5;
-    const j = Math.abs(x) % (i + 1);
-    [a[i], a[j]] = [a[j]!, a[i]!];
-  }
-  return a;
+async function readCompleted(userId: string, mode: GameMode, dateKey: string): Promise<boolean> {
+  return (await redis.get(kCompleted(userId, mode, dateKey))) === "1";
 }
 
-async function safeSubInfo(name: string): Promise<any | null> {
-  try {
-    return await reddit.getSubredditInfoByName(name);
-  } catch {
-    return null;
-  }
+async function setCompleted(userId: string, mode: GameMode, dateKey: string): Promise<void> {
+  const key = kCompleted(userId, mode, dateKey);
+  await redis.set(key, "1");
+  await redis.expire(key, 60 * 60 * 48);
 }
 
 // -------- subreddit selection (API-driven, no allowlist) --------
-// Fixes "medium == hard" by NOT treating unknown subscriber counts as qualifying for medium/easy.
 async function pickSubredditForMode(dateKey: string, mode: GameMode): Promise<string> {
   const minSubs = minSubsForMode(mode);
 
   let posts: any[] = [];
   try {
-    posts = await reddit
-      .getNewPosts({ subredditName: "all", limit: 150, pageSize: 150 })
-      .all();
+    posts = await reddit.getNewPosts({ subredditName: "all", limit: 120, pageSize: 120 }).all();
   } catch {
-    posts = await reddit
-      .getHotPosts({ subredditName: "all", limit: 150, pageSize: 150 })
-      .all();
+    posts = await reddit.getHotPosts({ subredditName: "all", limit: 120, pageSize: 120 }).all();
   }
 
-  const rawSubs = posts
-    .map((p) => getPostSubredditName(p))
-    .filter((s): s is string => !!s);
+  const candidates = posts
+    .map((p) => ({ post: p, sub: getPostSubredditName(p) }))
+    .filter((x) => !!x.sub) as { post: any; sub: string }[];
 
-  const uniqueSubs = Array.from(new Set(rawSubs));
-  if (uniqueSubs.length === 0) return "all";
+  if (candidates.length === 0) return "all";
 
-  // Deterministic scan order per (date, mode) so each mode tends to diverge.
-  const scanSeed = seedFromString(`${dateKey}:${mode}:scan`);
-  const subsToScan = shuffleDeterministic(uniqueSubs, scanSeed);
+  // mode is part of seed so easy/medium/hard pick different subs
+  const baseSeed = seedFromString(`${dateKey}:${mode}:subpick`);
+  const tried = new Set<string>();
 
-  // HARD: anything (still prefer non-NSFW when info is available)
-  if (mode === "hard") {
-    for (let i = 0; i < Math.min(40, subsToScan.length); i++) {
-      const sub = subsToScan[i]!;
-      const info = await safeSubInfo(sub);
-      if (!info) continue;
+  for (let i = 0; i < Math.min(45, candidates.length); i++) {
+    const idx = pickIndex(candidates.length, seedFromString(`${baseSeed}:${i}`));
+    const sub = candidates[idx]!.sub;
+    if (tried.has(sub)) continue;
+    tried.add(sub);
+
+    try {
+      const info = await reddit.getSubredditInfoByName(sub);
       if (isNsfwSub(info)) continue;
-      return sub;
+
+      const subs = getSubscriberCount(info);
+
+      // lenient if subscriber count unknown
+      if (subs === 0 || subs >= minSubs) return sub;
+    } catch {
+      continue;
     }
-    // fallback if info lookups fail
-    return subsToScan[pickIndex(subsToScan.length, scanSeed)]!;
   }
 
-  // EASY/MEDIUM: require a *known* subscriber count to qualify (subs > 0)
-  const qualifying: { sub: string; subs: number }[] = [];
-  const unknownButSafe: string[] = [];
-
-  for (let i = 0; i < Math.min(60, subsToScan.length); i++) {
-    const sub = subsToScan[i]!;
-    const info = await safeSubInfo(sub);
-    if (!info) continue;
-    if (isNsfwSub(info)) continue;
-
-    const subs = getSubscriberCount(info);
-
-    if (subs > 0) {
-      if (subs >= minSubs) qualifying.push({ sub, subs });
-    } else {
-      unknownButSafe.push(sub);
-    }
-
-    if (qualifying.length >= 12) break;
-  }
-
-  if (qualifying.length > 0) {
-    // OPTIONAL: make easy a bit easier by biasing to bigger subs (still API-driven, no hardcoding)
-    const bucket =
-      mode === "easy"
-        ? qualifying.sort((a, b) => b.subs - a.subs).slice(0, 12)
-        : qualifying;
-
-    const pickSeed = seedFromString(`${dateKey}:${mode}:pickQualified`);
-    return bucket[pickIndex(bucket.length, pickSeed)]!.sub;
-  }
-
-  // Fallback so we never get stuck
-  if (unknownButSafe.length > 0) {
-    const pickSeed = seedFromString(`${dateKey}:${mode}:pickUnknown`);
-    return unknownButSafe[pickIndex(unknownButSafe.length, pickSeed)]!;
-  }
-
-  return subsToScan[pickIndex(subsToScan.length, scanSeed)]!;
+  return candidates[pickIndex(candidates.length, baseSeed)]!.sub;
 }
 
-async function buildDailyPuzzle(
-  dateKey: string,
-  mode: GameMode
-): Promise<DailyPuzzle> {
+async function buildDailyPuzzle(dateKey: string, mode: GameMode): Promise<DailyPuzzle> {
   const cacheKey = `nts:puzzle:${dateKey}:${mode}`;
   const cached = await redis.get(cacheKey);
   if (cached) return JSON.parse(cached) as DailyPuzzle;
@@ -234,13 +172,9 @@ async function buildDailyPuzzle(
 
   let posts: any[] = [];
   try {
-    posts = await reddit
-      .getNewPosts({ subredditName: subreddit, limit: 50, pageSize: 50 })
-      .all();
+    posts = await reddit.getNewPosts({ subredditName: subreddit, limit: 50, pageSize: 50 }).all();
   } catch {
-    posts = await reddit
-      .getHotPosts({ subredditName: subreddit, limit: 50, pageSize: 50 })
-      .all();
+    posts = await reddit.getHotPosts({ subredditName: subreddit, limit: 50, pageSize: 50 }).all();
   }
 
   if (posts.length === 0) throw new Error(`No posts found for r/${subreddit}`);
@@ -301,7 +235,6 @@ async function buildDailyPuzzle(
 export const game = new Hono();
 
 // GET /api/game/state?mode=...
-// IMPORTANT: do NOT commit/lock here.
 game.get("/state", async (c) => {
   const requestedMode = normalizeMode(c.req.query("mode"));
   const dateKey = utcDateKey();
@@ -310,6 +243,8 @@ game.get("/state", async (c) => {
   const userId = user?.id ?? "anon";
 
   const modeIsLocked = await readCommitted(userId, requestedMode, dateKey);
+  const completedToday = await readCompleted(userId, requestedMode, dateKey);
+
   const puzzle = await buildDailyPuzzle(dateKey, requestedMode);
 
   const totalScore = Number((await redis.get(kScore(userId, requestedMode))) ?? 0);
@@ -321,6 +256,7 @@ game.get("/state", async (c) => {
     puzzle,
     modeLocked: requestedMode,
     modeIsLocked,
+    completedToday,
     totalScore,
     streak,
     lastPlayedDateKey,
@@ -330,7 +266,6 @@ game.get("/state", async (c) => {
 });
 
 // POST /api/game/lock  body: { mode }
-// Called when user hits "Reveal next clue" for the FIRST time (stage 1 -> 2)
 game.post("/lock", async (c) => {
   const body = (await c.req.json().catch(() => ({}))) as any;
   const requestedMode = normalizeMode(body.mode);
@@ -339,14 +274,43 @@ game.post("/lock", async (c) => {
   const user = await reddit.getCurrentUser();
   const userId = user?.id ?? "anon";
 
-  const already = await readCommitted(userId, requestedMode, dateKey);
-  if (!already) await commitMode(userId, requestedMode, dateKey);
+  if (!(await readCommitted(userId, requestedMode, dateKey))) {
+    await commitMode(userId, requestedMode, dateKey);
+  }
 
-  return c.json({ modeLocked: requestedMode, modeIsLocked: true });
+  const completedToday = await readCompleted(userId, requestedMode, dateKey);
+
+  return c.json({ modeLocked: requestedMode, modeIsLocked: true, completedToday });
+});
+
+// POST /api/game/giveup  body: { mode }
+game.post("/giveup", async (c) => {
+  const body = (await c.req.json().catch(() => ({}))) as any;
+  const requestedMode = normalizeMode(body.mode);
+
+  const dateKey = utcDateKey();
+  const user = await reddit.getCurrentUser();
+  const userId = user?.id ?? "anon";
+
+  if (!(await readCommitted(userId, requestedMode, dateKey))) {
+    await commitMode(userId, requestedMode, dateKey);
+  }
+
+  if (!(await readCompleted(userId, requestedMode, dateKey))) {
+    await setCompleted(userId, requestedMode, dateKey);
+  }
+
+  const puzzle = await buildDailyPuzzle(dateKey, requestedMode);
+
+  return c.json({
+    modeLocked: requestedMode,
+    modeIsLocked: true,
+    completedToday: true,
+    answer: puzzle.subreddit,
+  });
 });
 
 // POST /api/game/guess  body: { subredditGuess, stageUsed, mode }
-// Commits the mode if not committed already (first guess)
 game.post("/guess", async (c) => {
   const body = (await c.req.json().catch(() => ({}))) as any;
 
@@ -358,9 +322,10 @@ game.post("/guess", async (c) => {
   const user = await reddit.getCurrentUser();
   const userId = user?.id ?? "anon";
 
-  // Commit mode for this mode/day (so UI locks after first action)
-  const alreadyCommitted = await readCommitted(userId, requestedMode, dateKey);
-  if (!alreadyCommitted) await commitMode(userId, requestedMode, dateKey);
+  // lock after first guess
+  if (!(await readCommitted(userId, requestedMode, dateKey))) {
+    await commitMode(userId, requestedMode, dateKey);
+  }
 
   const puzzle = await buildDailyPuzzle(dateKey, requestedMode);
 
@@ -368,33 +333,46 @@ game.post("/guess", async (c) => {
   const answer = puzzle.subreddit;
   const correct = guess.toLowerCase() === answer.toLowerCase();
 
-  // Award points ONCE per day per mode
+  const alreadyCompleted = await readCompleted(userId, requestedMode, dateKey);
+
+  // final loss ends the mode too
+  const isFinalLoss = !correct && stageUsed === 3;
+  const finishesNow = correct || isFinalLoss;
+
+  // award only once/day/mode, only on win
   const playedKey = kPlayed(userId, requestedMode, dateKey);
   const alreadyAwarded = (await redis.get(playedKey)) === "1";
 
   let pointsAwarded = 0;
 
-  if (correct && !alreadyAwarded) {
-    pointsAwarded = stageUsed === 1 ? 100 : stageUsed === 2 ? 60 : 30;
+  if (!alreadyCompleted) {
+    if (correct && !alreadyAwarded) {
+      pointsAwarded = stageUsed === 1 ? 100 : stageUsed === 2 ? 60 : 30;
 
-    await redis.set(playedKey, "1");
-    await redis.expire(playedKey, 60 * 60 * 48);
+      await redis.set(playedKey, "1");
+      await redis.expire(playedKey, 60 * 60 * 48);
 
-    const prevScore = Number((await redis.get(kScore(userId, requestedMode))) ?? 0);
-    await redis.set(kScore(userId, requestedMode), String(prevScore + pointsAwarded));
+      const prevScore = Number((await redis.get(kScore(userId, requestedMode))) ?? 0);
+      await redis.set(kScore(userId, requestedMode), String(prevScore + pointsAwarded));
 
-    // Streak is per-mode
-    const lastDate = (await redis.get(kLastDate(userId, requestedMode))) ?? "";
-    const prevStreak = Number((await redis.get(kStreak(userId, requestedMode))) ?? 0);
-    const yesterday = utcDateKey(new Date(Date.now() - 24 * 60 * 60 * 1000));
-    const newStreak = lastDate === yesterday ? prevStreak + 1 : 1;
+      // streak increments only on win
+      const lastDate = (await redis.get(kLastDate(userId, requestedMode))) ?? "";
+      const prevStreak = Number((await redis.get(kStreak(userId, requestedMode))) ?? 0);
+      const yesterday = utcDateKey(new Date(Date.now() - 24 * 60 * 60 * 1000));
+      const newStreak = lastDate === yesterday ? prevStreak + 1 : 1;
 
-    await redis.set(kStreak(userId, requestedMode), String(newStreak));
-    await redis.set(kLastDate(userId, requestedMode), dateKey);
+      await redis.set(kStreak(userId, requestedMode), String(newStreak));
+      await redis.set(kLastDate(userId, requestedMode), dateKey);
+    }
+
+    if (finishesNow) {
+      await setCompleted(userId, requestedMode, dateKey);
+    }
   }
 
   const totalScore = Number((await redis.get(kScore(userId, requestedMode))) ?? 0);
   const streak = Number((await redis.get(kStreak(userId, requestedMode))) ?? 0);
+  const completedToday = await readCompleted(userId, requestedMode, dateKey);
 
   const payload: GuessResponse = {
     correct,
@@ -405,6 +383,7 @@ game.post("/guess", async (c) => {
     streak,
     modeLocked: requestedMode,
     modeIsLocked: true,
+    completedToday,
   };
 
   return c.json(payload);

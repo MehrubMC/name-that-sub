@@ -43,8 +43,9 @@ export type DailyPuzzle = {
 export type GetStateResponse = {
   puzzle: DailyPuzzle;
 
-  modeLocked: GameMode;     // current effective mode for puzzle shown
-  modeIsLocked: boolean;    // whether user has "committed" today
+  modeLocked: GameMode; // current effective mode for puzzle shown
+  modeIsLocked: boolean; // whether user has "committed" today (after first reveal or first guess)
+  completedToday: boolean; // finished this mode today (win, stage-3 loss, or give up)
 
   totalScore: number;
   streak: number;
@@ -62,11 +63,22 @@ export type GuessResponse = {
 
   modeLocked: GameMode;
   modeIsLocked: boolean;
+
+  // NEW: lets client show modal immediately without waiting for refetch
+  completedToday: boolean;
 };
 
 export type LockModeResponse = {
   modeLocked: GameMode;
   modeIsLocked: boolean;
+  completedToday: boolean;
+};
+
+export type GiveUpResponse = {
+  modeLocked: GameMode;
+  modeIsLocked: boolean;
+  completedToday: boolean;
+  answer: string;
 };
 
 // --------------------
@@ -92,7 +104,7 @@ export async function apiGuess(
   return res.json();
 }
 
-// NEW: lock mode when user reveals the 2nd clue (first reveal)
+// lock mode when user reveals the 2nd clue (first reveal)
 export async function apiLockMode(mode: GameMode): Promise<LockModeResponse> {
   const res = await fetch("/api/game/lock", {
     method: "POST",
@@ -100,5 +112,15 @@ export async function apiLockMode(mode: GameMode): Promise<LockModeResponse> {
     body: JSON.stringify({ mode }),
   });
   if (!res.ok) throw new Error(`Failed /api/game/lock: ${res.status}`);
+  return res.json();
+}
+
+export async function apiGiveUp(mode: GameMode): Promise<GiveUpResponse> {
+  const res = await fetch("/api/game/giveup", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mode }),
+  });
+  if (!res.ok) throw new Error(`Failed /api/game/giveup: ${res.status}`);
   return res.json();
 }
