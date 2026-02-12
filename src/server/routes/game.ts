@@ -1,18 +1,17 @@
 // src/server/routes/game.ts
 import { Hono } from "hono";
 import { redis, reddit } from "@devvit/web/server";
-import type {
-  DailyPuzzle,
-  GameMode,
-  GetStateResponse,
-  GuessResponse,
-} from "../../shared/api";
+import type { DailyPuzzle, GameMode, GetStateResponse, GuessResponse } from "../../shared/api";
 
 function utcDateKey(d = new Date()): string {
   const y = d.getUTCFullYear();
   const m = String(d.getUTCMonth() + 1).padStart(2, "0");
   const day = String(d.getUTCDate()).padStart(2, "0");
   return `${y}-${m}-${day}`;
+}
+
+function utcDateKeyOffset(daysOffset: number): string {
+  return utcDateKey(new Date(Date.now() + daysOffset * 24 * 60 * 60 * 1000));
 }
 
 function normalizeGuess(input: string): string {
@@ -24,6 +23,25 @@ function normalizeMode(raw: unknown): GameMode {
   const s = String(raw ?? "").toLowerCase();
   if (s === "easy" || s === "medium" || s === "hard") return s;
   return "medium";
+}
+
+/**
+ * We accept a client-provided YYYY-MM-DD dateKey so "daily" aligns to the user's local day.
+ * To avoid abuse (jumping far into the future/past), we only accept keys within +/- 1 day of UTC "today".
+ */
+function normalizeClientDateKey(raw: unknown): string {
+  const s = String(raw ?? "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return utcDateKey();
+  return s;
+}
+
+function resolveDateKey(queryOrBodyDateKey: unknown): string {
+  const dk = normalizeClientDateKey(queryOrBodyDateKey);
+
+  const allowed = new Set([utcDateKeyOffset(-1), utcDateKeyOffset(0), utcDateKeyOffset(1)]);
+  // If the client key is outside the safe window, fall back to UTC today.
+  if (!allowed.has(dk)) return utcDateKey();
+  return dk;
 }
 
 function seedFromString(str: string): number {
@@ -64,13 +82,7 @@ function getSubscriberCount(info: any): number {
 }
 
 function isNsfwSub(info: any): boolean {
-  const candidates = [
-    info?.nsfw,
-    info?.isNsfw,
-    info?.over18,
-    info?.isOver18,
-    info?.over_18,
-  ];
+  const candidates = [info?.nsfw, info?.isNsfw, info?.over18, info?.isOver18, info?.over_18];
   return candidates.some((v) => v === true);
 }
 
@@ -179,8 +191,7 @@ async function buildDailyPuzzle(dateKey: string, mode: GameMode): Promise<DailyP
 
   if (posts.length === 0) throw new Error(`No posts found for r/${subreddit}`);
 
-  const post =
-    posts[pickIndex(posts.length, seedFromString(`${dateKey}:${mode}:${subreddit}:post`))];
+  const post = posts[pickIndex(posts.length, seedFromString(`${dateKey}:${mode}:${subreddit}:post`))];
 
   const postId: string = post.id;
   const postTitle: string = post.title ?? "";
@@ -213,8 +224,7 @@ async function buildDailyPuzzle(dateKey: string, mode: GameMode): Promise<DailyP
 
   if (pool.length === 0) throw new Error(`No usable comments for post ${postId}`);
 
-  const comment =
-    pool[pickIndex(pool.length, seedFromString(`${dateKey}:${mode}:${subreddit}:comment`))];
+  const comment = pool[pickIndex(pool.length, seedFromString(`${dateKey}:${mode}:${subreddit}:comment`))];
 
   const puzzle: DailyPuzzle = {
     dateKey,
@@ -234,10 +244,10 @@ async function buildDailyPuzzle(dateKey: string, mode: GameMode): Promise<DailyP
 
 export const game = new Hono();
 
-// GET /api/game/state?mode=...
+// GET /api/game/state?mode=...&dateKey=...
 game.get("/state", async (c) => {
   const requestedMode = normalizeMode(c.req.query("mode"));
-  const dateKey = utcDateKey();
+  const dateKey = resolveDateKey(c.req.query("dateKey"));
 
   const user = await reddit.getCurrentUser();
   const userId = user?.id ?? "anon";
@@ -249,8 +259,7 @@ game.get("/state", async (c) => {
 
   const totalScore = Number((await redis.get(kScore(userId, requestedMode))) ?? 0);
   const streak = Number((await redis.get(kStreak(userId, requestedMode))) ?? 0);
-  const lastPlayedDateKey =
-    (await redis.get(kLastDate(userId, requestedMode))) ?? undefined;
+  const lastPlayedDateKey = (await redis.get(kLastDate(userId, requestedMode))) ?? undefined;
 
   const payload: GetStateResponse = {
     puzzle,
@@ -265,12 +274,12 @@ game.get("/state", async (c) => {
   return c.json(payload);
 });
 
-// POST /api/game/lock  body: { mode }
+// POST /api/game/lock  body: { mode, dateKey }
 game.post("/lock", async (c) => {
   const body = (await c.req.json().catch(() => ({}))) as any;
   const requestedMode = normalizeMode(body.mode);
+  const dateKey = resolveDateKey(body.dateKey);
 
-  const dateKey = utcDateKey();
   const user = await reddit.getCurrentUser();
   const userId = user?.id ?? "anon";
 
@@ -283,12 +292,12 @@ game.post("/lock", async (c) => {
   return c.json({ modeLocked: requestedMode, modeIsLocked: true, completedToday });
 });
 
-// POST /api/game/giveup  body: { mode }
+// POST /api/game/giveup  body: { mode, dateKey }
 game.post("/giveup", async (c) => {
   const body = (await c.req.json().catch(() => ({}))) as any;
   const requestedMode = normalizeMode(body.mode);
+  const dateKey = resolveDateKey(body.dateKey);
 
-  const dateKey = utcDateKey();
   const user = await reddit.getCurrentUser();
   const userId = user?.id ?? "anon";
 
@@ -310,15 +319,15 @@ game.post("/giveup", async (c) => {
   });
 });
 
-// POST /api/game/guess  body: { subredditGuess, stageUsed, mode }
+// POST /api/game/guess  body: { subredditGuess, stageUsed, mode, dateKey }
 game.post("/guess", async (c) => {
   const body = (await c.req.json().catch(() => ({}))) as any;
 
   const subredditGuess: string = String(body.subredditGuess ?? "");
   const stageUsed: 1 | 2 | 3 = body.stageUsed ?? 3;
   const requestedMode = normalizeMode(body.mode);
+  const dateKey = resolveDateKey(body.dateKey);
 
-  const dateKey = utcDateKey();
   const user = await reddit.getCurrentUser();
   const userId = user?.id ?? "anon";
 
@@ -358,6 +367,10 @@ game.post("/guess", async (c) => {
       // streak increments only on win
       const lastDate = (await redis.get(kLastDate(userId, requestedMode))) ?? "";
       const prevStreak = Number((await redis.get(kStreak(userId, requestedMode))) ?? 0);
+
+      // "yesterday" relative to the *dateKey* (string) is tricky on server.
+      // We keep streak logic based on UTC day boundary for safety.
+      // (Streak is still per-mode and consistent; daily puzzle boundary is client-local.)
       const yesterday = utcDateKey(new Date(Date.now() - 24 * 60 * 60 * 1000));
       const newStreak = lastDate === yesterday ? prevStreak + 1 : 1;
 

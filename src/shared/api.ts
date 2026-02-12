@@ -28,7 +28,7 @@ export type DecrementResponse = {
 // Game types
 // --------------------
 export type DailyPuzzle = {
-  dateKey: string; // YYYY-MM-DD UTC
+  dateKey: string; // YYYY-MM-DD (client-local dateKey used by server)
   mode: GameMode;
 
   subreddit: string;
@@ -64,7 +64,7 @@ export type GuessResponse = {
   modeLocked: GameMode;
   modeIsLocked: boolean;
 
-  // NEW: lets client show modal immediately without waiting for refetch
+  // lets client show modal immediately without waiting for refetch
   completedToday: boolean;
 };
 
@@ -84,8 +84,10 @@ export type GiveUpResponse = {
 // --------------------
 // Client fetch helpers
 // --------------------
-export async function apiGetState(mode: GameMode): Promise<GetStateResponse> {
-  const res = await fetch(`/api/game/state?mode=${encodeURIComponent(mode)}`);
+export async function apiGetState(mode: GameMode, dateKey: string): Promise<GetStateResponse> {
+  const res = await fetch(
+    `/api/game/state?mode=${encodeURIComponent(mode)}&dateKey=${encodeURIComponent(dateKey)}`
+  );
   if (!res.ok) throw new Error(`Failed /api/game/state: ${res.status}`);
   return res.json();
 }
@@ -93,33 +95,34 @@ export async function apiGetState(mode: GameMode): Promise<GetStateResponse> {
 export async function apiGuess(
   subredditGuess: string,
   stageUsed: 1 | 2 | 3,
-  mode: GameMode
+  mode: GameMode,
+  dateKey: string
 ): Promise<GuessResponse> {
   const res = await fetch("/api/game/guess", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ subredditGuess, stageUsed, mode }),
+    body: JSON.stringify({ subredditGuess, stageUsed, mode, dateKey }),
   });
   if (!res.ok) throw new Error(`Failed /api/game/guess: ${res.status}`);
   return res.json();
 }
 
 // lock mode when user reveals the 2nd clue (first reveal)
-export async function apiLockMode(mode: GameMode): Promise<LockModeResponse> {
+export async function apiLockMode(mode: GameMode, dateKey: string): Promise<LockModeResponse> {
   const res = await fetch("/api/game/lock", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ mode }),
+    body: JSON.stringify({ mode, dateKey }),
   });
   if (!res.ok) throw new Error(`Failed /api/game/lock: ${res.status}`);
   return res.json();
 }
 
-export async function apiGiveUp(mode: GameMode): Promise<GiveUpResponse> {
+export async function apiGiveUp(mode: GameMode, dateKey: string): Promise<GiveUpResponse> {
   const res = await fetch("/api/game/giveup", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ mode }),
+    body: JSON.stringify({ mode, dateKey }),
   });
   if (!res.ok) throw new Error(`Failed /api/game/giveup: ${res.status}`);
   return res.json();

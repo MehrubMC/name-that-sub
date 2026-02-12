@@ -19,13 +19,18 @@ function normalizeInput(v: string) {
   return s;
 }
 
-function utcTomorrowKey() {
-  const d = new Date();
-  d.setUTCDate(d.getUTCDate() + 1);
-  const y = d.getUTCFullYear();
-  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const day = String(d.getUTCUTCDate?.() ?? d.getUTCDate()).padStart(2, "0"); // safety
+// Local YYYY-MM-DD (device timezone)
+function localDateKey(d = new Date()) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
   return `${y}-${m}-${day}`;
+}
+
+function localTomorrowKey() {
+  const d = new Date();
+  d.setDate(d.getDate() + 1);
+  return localDateKey(d);
 }
 
 function Modal({
@@ -58,24 +63,11 @@ function Modal({
           </button>
         </div>
 
-        <div
-          style={{
-            marginTop: 10,
-            color: "rgba(255,255,255,0.85)",
-            lineHeight: 1.4,
-          }}
-        >
+        <div style={{ marginTop: 10, color: "rgba(255,255,255,0.85)", lineHeight: 1.4 }}>
           {body}
         </div>
 
-        <div
-          style={{
-            marginTop: 14,
-            display: "flex",
-            gap: 10,
-            justifyContent: "flex-end",
-          }}
-        >
+        <div style={{ marginTop: 14, display: "flex", gap: 10, justifyContent: "flex-end" }}>
           <button onClick={onClose} style={styles.primaryBtn}>
             Got it
           </button>
@@ -100,12 +92,13 @@ function GameApp() {
   const [modalTitle, setModalTitle] = useState("");
   const [modalBody, setModalBody] = useState<React.ReactNode>(null);
 
+  // The "daily" key used for ALL calls in this session
+  const [dateKey] = useState(() => localDateKey());
+
   // MODE
   const [mode, setMode] = useState<GameMode>(() => {
     const saved = localStorage.getItem("nts:mode");
-    return saved === "easy" || saved === "medium" || saved === "hard"
-      ? saved
-      : "medium";
+    return saved === "easy" || saved === "medium" || saved === "hard" ? saved : "medium";
   });
 
   useEffect(() => {
@@ -113,17 +106,16 @@ function GameApp() {
   }, [mode]);
 
   function openAlreadyPlayedModal(m: GameMode) {
-    const tomorrow = utcTomorrowKey();
+    const tomorrow = localTomorrowKey();
     setModalTitle("Already played");
     setModalBody(
       <div>
         <div style={{ marginBottom: 10 }}>
-          You already played <span style={{ fontWeight: 900 }}>{m.toUpperCase()}</span>{" "}
-          today. Come back tomorrow for a new puzzle.
+          You already played <span style={{ fontWeight: 900 }}>{m.toUpperCase()}</span> today. Come
+          back tomorrow for a new puzzle.
         </div>
         <div style={styles.callout}>
-          Next puzzle available{" "}
-          <span style={{ opacity: 0.9 }}>(UTC: {tomorrow})</span>.
+          Next puzzle available <span style={{ opacity: 0.9 }}>(Local: {tomorrow})</span>.
         </div>
       </div>
     );
@@ -133,10 +125,9 @@ function GameApp() {
   useEffect(() => {
     (async () => {
       try {
-        const s = await apiGetState(mode);
+        const s = await apiGetState(mode, dateKey);
         setState(s);
 
-        // if they load into a completed mode, tell them
         if (s.completedToday) {
           setToast(`You already played ${mode.toUpperCase()} today.`);
         }
@@ -161,7 +152,7 @@ function GameApp() {
     if (!state) return;
     if (state.modeIsLocked) return;
     try {
-      const res = await apiLockMode(mode);
+      const res = await apiLockMode(mode, dateKey);
       setState((prev) =>
         prev
           ? {
@@ -179,26 +170,28 @@ function GameApp() {
 
   async function nextClue() {
     setToast(null);
+
     if (state?.completedToday) {
       openAlreadyPlayedModal(mode);
       return;
     }
+
     if (stage === 1) await lockIfNeeded();
     setStage((s) => (s === 1 ? 2 : s === 2 ? 3 : 3));
   }
 
   function openComeBackModal(kind: "win" | "giveup", answer: string) {
-    const tomorrow = utcTomorrowKey();
+    const tomorrow = localTomorrowKey();
     setModalTitle(kind === "win" ? "Nice!" : "All good!");
     setModalBody(
       <div>
         <div style={{ marginBottom: 10 }}>
-          {kind === "win" ? "You got it." : "Better luck next time."} The answer
-          was <span style={{ fontWeight: 800 }}>r/{answer}</span>.
+          {kind === "win" ? "You got it." : "Better luck next time."} The answer was{" "}
+          <span style={{ fontWeight: 800 }}>r/{answer}</span>.
         </div>
         <div style={styles.callout}>
           Come back tomorrow for the next puzzle{" "}
-          <span style={{ opacity: 0.9 }}>(UTC: {tomorrow})</span>.
+          <span style={{ opacity: 0.9 }}>(Local: {tomorrow})</span>.
         </div>
       </div>
     );
@@ -207,6 +200,7 @@ function GameApp() {
 
   async function submitGuess() {
     if (!puzzle) return;
+
     if (state?.completedToday) {
       openAlreadyPlayedModal(mode);
       return;
@@ -219,7 +213,7 @@ function GameApp() {
     setToast(null);
 
     try {
-      const res = await apiGuess(cleaned, stage, mode);
+      const res = await apiGuess(cleaned, stage, mode, dateKey);
 
       // keep state consistent immediately
       setState((prev) =>
@@ -237,9 +231,7 @@ function GameApp() {
 
       if (res.correct) {
         setRevealedAnswer(res.answer);
-        setToast(
-          `✅ Correct! +${res.pointsAwarded} pts · Streak ${res.streak} · Total ${res.totalScore}`
-        );
+        setToast(`✅ Correct! +${res.pointsAwarded} pts · Streak ${res.streak} · Total ${res.totalScore}`);
         openComeBackModal("win", res.answer);
       } else {
         if (stage < 3) setToast("❌ Not quite. Reveal the next clue or try again.");
@@ -250,8 +242,7 @@ function GameApp() {
         }
       }
 
-      // refresh state for the current mode
-      const s = await apiGetState(mode);
+      const s = await apiGetState(mode, dateKey);
       setState(s);
     } catch (e: any) {
       setToast(e?.message ?? "Failed to submit guess.");
@@ -272,7 +263,7 @@ function GameApp() {
     setToast(null);
 
     try {
-      const res = await apiGiveUp(mode);
+      const res = await apiGiveUp(mode, dateKey);
 
       setStage(3);
       setRevealedAnswer(res.answer);
@@ -291,7 +282,7 @@ function GameApp() {
       setToast(`Answer: r/${res.answer}`);
       openComeBackModal("giveup", res.answer);
 
-      const s = await apiGetState(mode);
+      const s = await apiGetState(mode, dateKey);
       setState(s);
     } catch (e: any) {
       setToast(e?.message ?? "Failed to give up.");
@@ -314,7 +305,7 @@ function GameApp() {
     setToast(null);
 
     try {
-      const s = await apiGetState(m);
+      const s = await apiGetState(m, dateKey);
       setState(s);
 
       // reset per-mode UI
@@ -322,7 +313,6 @@ function GameApp() {
       setGuess("");
       setRevealedAnswer(null);
 
-      // IMPORTANT: show popup if they already played this mode
       if (s.completedToday) {
         setToast(`You already played ${m.toUpperCase()} today.`);
         openAlreadyPlayedModal(m);
@@ -339,12 +329,8 @@ function GameApp() {
       <div style={styles.pageFixed}>
         <div style={styles.centerWrap}>
           <div style={styles.glassCard}>
-            <div style={{ fontSize: 18, fontWeight: 800 }}>
-              Loading today’s puzzle…
-            </div>
-            <div style={{ marginTop: 10, opacity: 0.75 }}>
-              Fetching a cursed comment from Reddit.
-            </div>
+            <div style={{ fontSize: 18, fontWeight: 800 }}>Loading today’s puzzle…</div>
+            <div style={{ marginTop: 10, opacity: 0.75 }}>Fetching a cursed comment from Reddit.</div>
           </div>
         </div>
       </div>
@@ -356,12 +342,8 @@ function GameApp() {
       <div style={styles.pageFixed}>
         <div style={styles.centerWrap}>
           <div style={styles.glassCard}>
-            <div style={{ fontSize: 18, fontWeight: 900 }}>
-              Couldn’t load today’s puzzle
-            </div>
-            <div style={{ marginTop: 10, opacity: 0.8 }}>
-              {toast ?? "Try refreshing."}
-            </div>
+            <div style={{ fontSize: 18, fontWeight: 900 }}>Couldn’t load today’s puzzle</div>
+            <div style={{ marginTop: 10, opacity: 0.8 }}>{toast ?? "Try refreshing."}</div>
           </div>
         </div>
       </div>
@@ -391,9 +373,7 @@ function GameApp() {
 
             {completed && (
               <div style={{ marginTop: 8 }}>
-                <div style={styles.completedBanner}>
-                  You already played this mode today — come back tomorrow.
-                </div>
+                <div style={styles.completedBanner}>You already played this mode today — come back tomorrow.</div>
               </div>
             )}
           </div>
@@ -424,9 +404,7 @@ function GameApp() {
             <section style={styles.glassCard}>
               <div style={styles.cardTopRow}>
                 <div style={styles.pill}>{stageLabel}</div>
-                <div style={{ opacity: 0.65, fontSize: 12 }}>
-                  Tip: Guess earlier for more points.
-                </div>
+                <div style={{ opacity: 0.65, fontSize: 12 }}>Tip: Guess earlier for more points.</div>
               </div>
 
               <div style={styles.block}>
@@ -438,11 +416,7 @@ function GameApp() {
                 <div style={styles.block}>
                   <div style={styles.blockLabel}>Post body</div>
                   <div style={styles.textBlock}>
-                    {puzzle.postBody?.trim() ? (
-                      puzzle.postBody
-                    ) : (
-                      <i style={{ opacity: 0.8 }}>(No body — title-only post)</i>
-                    )}
+                    {puzzle.postBody?.trim() ? puzzle.postBody : <i style={{ opacity: 0.8 }}>(No body — title-only post)</i>}
                   </div>
                 </div>
               )}
@@ -467,28 +441,16 @@ function GameApp() {
                     disabled={disabled}
                     onKeyDown={(e) => e.key === "Enter" && submitGuess()}
                   />
-                  <button
-                    onClick={submitGuess}
-                    disabled={disabled || !guess.trim()}
-                    style={styles.primaryBtn}
-                  >
+                  <button onClick={submitGuess} disabled={disabled || !guess.trim()} style={styles.primaryBtn}>
                     Guess
                   </button>
                 </div>
 
                 <div style={styles.btnRow}>
-                  <button
-                    onClick={nextClue}
-                    disabled={disabled || stage === 3}
-                    style={styles.secondaryBtn}
-                  >
+                  <button onClick={nextClue} disabled={disabled || stage === 3} style={styles.secondaryBtn}>
                     Reveal next clue
                   </button>
-                  <button
-                    onClick={giveUp}
-                    disabled={disabled}
-                    style={styles.ghostBtn}
-                  >
+                  <button onClick={giveUp} disabled={disabled} style={styles.ghostBtn}>
                     Give up
                   </button>
                 </div>
@@ -496,10 +458,7 @@ function GameApp() {
             </section>
 
             <footer style={styles.footer}>
-              <div style={{ opacity: 0.75 }}>
-                Make it a daily habit. Drop a comment with what clue you got it on
-                👀
-              </div>
+              <div style={{ opacity: 0.75 }}>Make it a daily habit. Drop a comment with what clue you got it on.</div>
             </footer>
 
             <div style={{ height: 18 }} />
@@ -513,12 +472,7 @@ function GameApp() {
         </div>
       )}
 
-      <Modal
-        open={modalOpen}
-        title={modalTitle}
-        body={modalBody}
-        onClose={() => setModalOpen(false)}
-      />
+      <Modal open={modalOpen} title={modalTitle} body={modalBody} onClose={() => setModalOpen(false)} />
     </div>
   );
 }
@@ -541,8 +495,7 @@ const styles: Record<string, React.CSSProperties> = {
     position: "absolute",
     inset: 0,
     pointerEvents: "none",
-    background:
-      "radial-gradient(600px 240px at 50% 0%, rgba(255,255,255,0.10), transparent 70%)",
+    background: "radial-gradient(600px 240px at 50% 0%, rgba(255,255,255,0.10), transparent 70%)",
   },
   shell: {
     position: "relative",
@@ -577,8 +530,7 @@ const styles: Record<string, React.CSSProperties> = {
     alignItems: "flex-start",
     justifyContent: "space-between",
     gap: 16,
-    padding:
-      "0 max(16px, env(safe-area-inset-right)) 10px max(16px, env(safe-area-inset-left))",
+    padding: "0 max(16px, env(safe-area-inset-right)) 10px max(16px, env(safe-area-inset-left))",
     flexWrap: "wrap",
   },
   titleRow: { display: "flex", alignItems: "center", gap: 10 },
@@ -692,12 +644,7 @@ const styles: Record<string, React.CSSProperties> = {
     boxShadow: "0 -10px 40px rgba(0,0,0,0.35)",
   },
 
-  inputRow: {
-    display: "flex",
-    alignItems: "center",
-    gap: 10,
-    flexWrap: "wrap",
-  },
+  inputRow: { display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" },
   inputPrefix: {
     padding: "10px 12px",
     borderRadius: 12,
@@ -723,8 +670,7 @@ const styles: Record<string, React.CSSProperties> = {
     padding: "10px 14px",
     borderRadius: 12,
     border: "1px solid rgba(255,255,255,0.18)",
-    background:
-      "linear-gradient(180deg, rgba(255,69,0,0.95), rgba(255,69,0,0.75))",
+    background: "linear-gradient(180deg, rgba(255,69,0,0.95), rgba(255,69,0,0.75))",
     color: "white",
     fontWeight: 900,
     cursor: "pointer",
@@ -841,8 +787,7 @@ const styles: Record<string, React.CSSProperties> = {
     padding: "8px 10px",
     borderRadius: 999,
     border: "1px solid rgba(255,255,255,0.18)",
-    background:
-      "linear-gradient(180deg, rgba(255,69,0,0.95), rgba(255,69,0,0.65))",
+    background: "linear-gradient(180deg, rgba(255,69,0,0.95), rgba(255,69,0,0.65))",
     color: "white",
     fontWeight: 900,
     fontSize: 12,
